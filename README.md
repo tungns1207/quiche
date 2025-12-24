@@ -27,6 +27,7 @@ bazel-bin/quiche/masque_server --certificate_file certs/server.crt --key_file ce
 
 ### 2. Set the SSLKEYLOGFILE and start the client
 ```bash
+export SSLKEYLOGFILE=certs/key.log
 bazel-bin/quiche/masque_client --disable_certificate_verification=true 127.0.0.1:9661 https://cloudflare-quic.com
 ```
 ### 3. Capture using Wireshark and decrypt using the TLS key 
