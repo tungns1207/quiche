@@ -594,6 +594,7 @@ cc_binary(
         ":quiche_core",
         ":quiche_tool_support",
         "@boringssl//:crypto",
+        "@boringssl//:ssl",
         "@com_google_absl//absl/strings",
     ],
 )

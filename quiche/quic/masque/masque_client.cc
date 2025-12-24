@@ -8,6 +8,10 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <fstream>
+#include <mutex>
+#include <openssl/ssl.h>
+#include <cstdlib>
 
 #include "absl/memory/memory.h"
 #include "absl/strings/str_cat.h"
@@ -123,6 +127,45 @@ std::unique_ptr<MasqueClient> MasqueClient::Create(
   if (proof_source != nullptr) {
     masque_client->crypto_config()->set_proof_source(std::move(proof_source));
   }
+
+  // Set keylog callback if SSLKEYLOGFILE is set
+  const char* keylog_env = std::getenv("SSLKEYLOGFILE");
+  if (keylog_env != nullptr && keylog_env[0] != '\0' &&
+      masque_client->crypto_config() != nullptr) {
+    SSL_CTX* ssl_ctx = masque_client->crypto_config()->ssl_ctx();
+    if (ssl_ctx != nullptr) {
+      SSL_CTX_set_keylog_callback(ssl_ctx, [](const SSL* /*ssl*/, const char* line) {
+        static std::once_flag init_flag;
+        static std::unique_ptr<std::ofstream> keylog_file;
+        static std::mutex keylog_mutex;
+        std::call_once(init_flag, [&]() {
+          const char* env_path = std::getenv("SSLKEYLOGFILE");
+          std::string path = env_path ? env_path : "certs/key.log";
+          keylog_file = std::make_unique<std::ofstream>(path, std::ios::app);
+          if (keylog_file->is_open()) {
+            QUIC_LOG(INFO) << "Opened SSL keylog file: " << path;
+          } else {
+            QUIC_LOG(ERROR) << "Failed to open SSL keylog file: " << path;
+          }
+        });
+
+        if (!keylog_file || !keylog_file->is_open()) {
+          return;
+        }
+
+        // Skip EXPORTER_SECRET as it's not needed for QUIC decryption
+        if (std::string(line).find("EXPORTER_SECRET") == 0) {
+          return;
+        }
+
+        std::lock_guard<std::mutex> lock(keylog_mutex);
+        (*keylog_file) << line << std::endl;
+        keylog_file->flush();
+      });
+      QUIC_LOG(INFO) << "Keylog callback set on MASQUE client in Create";
+    }
+  }
+
   if (!masque_client->Prepare(kDefaultMaxPacketSizeForTunnels)) {
     QUIC_LOG(ERROR) << "Failed to prepare MASQUE client to " << host << ":"
                     << port;

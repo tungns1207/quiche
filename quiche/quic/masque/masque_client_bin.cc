@@ -47,6 +47,40 @@
 #include "quiche/common/platform/api/quiche_logging.h"
 #include "quiche/common/platform/api/quiche_reference_counted.h"
 #include "quiche/common/platform/api/quiche_system_event_loop.h"
+#include <fstream>
+#include <mutex>
+#include <openssl/ssl.h>
+#include <cstdlib>
+#include <memory>
+
+static void QuicKeyLogCallback(const SSL* /*ssl*/, const char* line) {
+  static std::once_flag init_flag;
+  static std::unique_ptr<std::ofstream> keylog_file;
+  static std::mutex keylog_mutex;
+  std::call_once(init_flag, [&]() {
+    // Hardcode path for testing
+    std::string path = "certs/key.log";
+    keylog_file = std::make_unique<std::ofstream>(path, std::ios::app);
+    if (keylog_file->is_open()) {
+      QUIC_LOG(INFO) << "Opened SSL keylog file: " << path;
+    } else {
+      QUIC_LOG(ERROR) << "Failed to open SSL keylog file: " << path;
+    }
+  });
+
+  if (!keylog_file || !keylog_file->is_open()) {
+    return;
+  }
+
+  // Skip EXPORTER_SECRET as it's not needed for QUIC decryption
+  if (std::string(line).find("EXPORTER_SECRET") == 0) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(keylog_mutex);
+  (*keylog_file) << line << std::endl;
+  keylog_file->flush();
+}
 
 DEFINE_QUICHE_COMMAND_LINE_FLAG(
     bool, disable_certificate_verification, false,
@@ -301,6 +335,9 @@ int RunMasqueClient(int argc, char* argv[]) {
       "  <proxy-url> is the URI template of the MASQUE server,\n"
       "  or host:port to use the default template";
 
+  // Check for SSLKEYLOGFILE env var early.
+  const char* keylog_env = std::getenv("SSLKEYLOGFILE");
+
   // The first non-flag argument is the URI template of the MASQUE server.
   // All subsequent ones are interpreted as URLs to fetch via the MASQUE server.
   // Note that the URI template expansion currently only supports string
@@ -502,6 +539,18 @@ int RunMasqueClient(int argc, char* argv[]) {
       return 1;
     }
 
+    // Install TLS keylog callback only if SSLKEYLOGFILE env var is set.
+    // Note: For main MASQUE client, it's set in MasqueClient::Create.
+    // For encapsulated clients, set it here since they may not go through Create.
+    if (keylog_env != nullptr && keylog_env[0] != '\0' &&
+        masque_client->crypto_config() != nullptr) {
+      SSL_CTX* ssl_ctx = masque_client->crypto_config()->ssl_ctx();
+      if (ssl_ctx != nullptr) {
+        SSL_CTX_set_keylog_callback(ssl_ctx, QuicKeyLogCallback);
+        QUIC_LOG(INFO) << "Keylog callback set on MASQUE client";
+      }
+    }
+
     QUIC_LOG(INFO) << "MASQUE[" << masque_clients.size() << "] to "
                    << uri_template << " is connected "
                    << masque_client->connection_id() << " in " << masque_mode
@@ -566,6 +615,15 @@ int RunMasqueClient(int argc, char* argv[]) {
               /*dns_on_client=*/dns_on_client ||
                   (masque_mode == MasqueMode::kConnectUdpBind),
               /*is_also_underlying=*/false);
+
+      // Install TLS keylog callback on encapsulated client always for testing.
+      if (encapsulated_client && encapsulated_client->crypto_config() != nullptr) {
+        SSL_CTX* ssl_ctx = encapsulated_client->crypto_config()->ssl_ctx();
+        if (ssl_ctx != nullptr) {
+          SSL_CTX_set_keylog_callback(ssl_ctx, QuicKeyLogCallback);
+          QUIC_LOG(INFO) << "Keylog callback set on encapsulated client for " << urls[i];
+        }
+      }
 
       if (!encapsulated_client || !tools::SendRequestOnMasqueEncapsulatedClient(
                                       *encapsulated_client, urls[i])) {
